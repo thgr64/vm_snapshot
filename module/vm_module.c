@@ -1,6 +1,6 @@
 /*
 	Kernel module
-
+	GPL v2
 */
 // used sources:
 // Understanding the Linux Kernel (UTLK)
@@ -16,9 +16,12 @@
 //   LGPL1.2
 
 // debugging
-//#define NODEBUG
+//#define DODEBUG
 
-#ifdef NODEBUG
+// to support legacy kernels
+#include <linux/version.h>
+
+#ifdef DODEBUG
 #define DEBUG
 // page releated debugging
 #define PDEBUG
@@ -104,7 +107,7 @@
 
 // GPL stuff, to keep the kernel nice and clean
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Thorsten");
+MODULE_AUTHOR("thgr64");
 MODULE_DESCRIPTION("vm_snapshot - ");
 
 //structs
@@ -124,7 +127,7 @@ struct PageTableEntryInfo
 	int reserved;
 
 	//page content hash
-	unsigned char hash[20]; //16 for just bytes, 32 for string, should be suitable for md5, crc32 and other patterns
+	unsigned char hash[20]; //20 for just bytes, 40 for string, should be suitable for md5, crc32 and other patterns
 
 }__attribute__((__packed__));
 
@@ -219,7 +222,9 @@ static int hash_page_superfast(struct page *pg, char *result);
 
 uint32_t SuperFastHash (const char * data, int len);
 
+#ifdef DODEBUG
 static char* print_page_hash(struct PageTableEntryInfo *ptei, char *result);
+#endif 
 
 static int acquire_mm_struct(int pid, struct mm_struct **result);
 static int release_mm_struct(struct mm_struct *result);
@@ -237,10 +242,6 @@ static int is_snapshot_available(void);
 
 static struct SnapshotInfo* allocate_snapshot(int vm_region_count, unsigned long page_count);
 static int free_snapshot(struct SnapshotInfo* snapshot);
-
-
-static int get_next_snapshot_info(struct SnapshotInfo *snapshot, struct SnapshotIterator *iter,char *result, int size);
-static int get_next_complete_snapshot_info(struct SnapshotInfo *snapshot, struct SnapshotIterator *iter,char *result, int size);
 
 static int get_next_raw_info(struct SnapshotInfo *snapshot, struct SnapshotIterator *iter, char *buffer, int size);
 
@@ -278,32 +279,35 @@ void cleanup_module(void)
 }
 
 // read_proc: the snapshot will leave through this function
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,0)
 static int read_proc_vm_snapshot(char *page, char **start, off_t off, int count, int *eof, void *data)
+#else
+static int read_proc_vm_snapshot(struct file *filp, char *page, size_t count, loff_t *off)
+#endif
 {
 	static struct SnapshotIterator iterator;
 	int in = 0;
-	int len=0, ret=0;
-	static int pos=0;
+	int ret = 0;
+	static int pos = 0;
 
 #ifdef IDEBUG
 	printk(KERN_INFO "%s.read_proc called: 0x%p, %p, %lu, %d\n", PROC_ENTRY_NAME, page, *start, off, count);
 #endif
 
-	if (iterator.out_last_offset != off)
+	//printk(KERN_INFO "OFFSET: %lx %lx\n", *off, off);
+
+	if (iterator.out_last_offset != *off)
 	{
 		memset(&iterator, 0, sizeof(struct SnapshotIterator));
-
 		pos = 0;
 	}
 	
-
 	if (is_snapshot_available())
 	{
-		if (gl_snapshot_ptr->flags & VMS_ALLOW_RAW_OUTPUT)
+		printk(KERN_ALERT "Retrieving snapshot\n");
+		if ((count==sizeof(struct SnapshotInfo) || iterator.out_next_data & OUTPUT_RAW))
 		{
-			if ((count==sizeof(struct SnapshotInfo) || iterator.out_next_data & OUTPUT_RAW))
-			{
-			
 				in = iterator.out_next_data;
 				ret = get_next_raw_info(gl_snapshot_ptr, &iterator, page, count);
 				if (iterator.out_next_data != in)
@@ -311,37 +315,22 @@ static int read_proc_vm_snapshot(char *page, char **start, off_t off, int count,
 				#ifdef DBEUG
 					printk("END OF ROAD\n");
 				#endif
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,0)
 					*eof = 1;
+#endif
 				}
 				iterator.out_last_offset += ret;
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,0)
 				*start = page;
+#else
+				*off += ret;
+#endif
 				return ret;
-			}
 		}
-		else
-		{
-			do
-			{
-				ret+=len;
-				if (gl_snapshot_ptr->flags & VMS_ONLY_PRESENT_PAGES || gl_snapshot_ptr->pid==0)
-					len = get_next_snapshot_info(gl_snapshot_ptr, &iterator, page+ret, count-ret);
-				else
-					len = get_next_complete_snapshot_info(gl_snapshot_ptr, &iterator, page+ret, count-ret);
-				
-				if (len == -1)
-				{
-					// this indicates end of file
-					*eof = 1;
-					//return 0;
-					break;
-				}
-			} while (len!=BUFFER_TOO_SMALL);
-
-			iterator.out_last_offset += ret;
-			*start = page;
-			return ret;
+		else {
+			return -EINVAL;
 		}
-
 	}
 	else
 	{
@@ -350,43 +339,17 @@ static int read_proc_vm_snapshot(char *page, char **start, off_t off, int count,
 	}
 	return 0;
 }
-static DEFINE_RWLOCK(resource_lock);
-
-static struct resource *r_next(struct resource *p, loff_t *pos)
-{
-		(*pos)++;
-		if (p->child)
-			return p->child;
-		while (!p->sibling && p->parent)
-			p = p->parent;
-		return p->sibling;
-}
-
-static void *r_start(struct resource *p, loff_t *pos)
-          __acquires(resource_lock)
-{
-
-	  loff_t l = 0;
-	  read_lock(&resource_lock);
-	  for (p = p->child; p && l < *pos; p = r_next(p, &l))
-		;
-		return p;
-}
-
-static void r_stop(void *v)
-          __releases(resource_lock)
-{
-	read_unlock(&resource_lock);
-}
-
 /// write_proc - gets input and triggers snapshot
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,0)
 static int write_proc_vm_snapshot(struct file *file, const char __user *buffer, unsigned long count, void *data)
+#else
+static int write_proc_vm_snapshot(struct file *filp, char *buffer, size_t count, loff_t *offp)
+#endif
 {
 	char buf[MAX_TMP_BUFFER+1];
 	unsigned long err=0;
 	int len = 0;
 	struct input_buffer input;
-
 
 #ifdef IDEBUG
 	printk(KERN_INFO "%s.write_proc called: %p, %p, %ld\n", PROC_ENTRY_NAME, file, buffer, count);
@@ -411,7 +374,6 @@ static int write_proc_vm_snapshot(struct file *file, const char __user *buffer, 
 
 		if (input.pid == 0)
 		{
-
 			//printk("Try to take all frames.\n");
 			release_global_snapshot();
 
@@ -423,8 +385,6 @@ static int write_proc_vm_snapshot(struct file *file, const char __user *buffer, 
 			}
 		
 			return count;
-
-			
 		}
 
 		// trigger snapshot creation
@@ -440,200 +400,102 @@ static int write_proc_vm_snapshot(struct file *file, const char __user *buffer, 
 	}
 	else
 	{
-		printk(KERN_ALERT "%s.write_proc: illegal input\n", PROC_ENTRY_NAME);
+		printk(KERN_ALERT "%s.write_proc: illegal input\tInput:%.16s\n", PROC_ENTRY_NAME, buf);
 		return -EINVAL;
 	}
 
 	return count;
 }
 
+struct file_operations device_fops = {
+	.owner = THIS_MODULE,
+	.read  = read_proc_vm_snapshot,
+	.write = write_proc_vm_snapshot
+};
 
-/// helps extracting data from a snapshot in human readable form
-/// assumes all structs exist
-static int get_next_complete_snapshot_info(struct SnapshotInfo *snapshot, struct SnapshotIterator *iter,char *result, int size)
+/// Creates the proc fs entry and sets up the userrights and stuff
+static int create_procfs_entry()
 {
-	static int pc =0;
-	int ret=0;
-	int pos = 0;
-	struct VirtualMemoryInfo *vmi;
-	char tmp_hash[MAX_HASH_SIZE*2+1];
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,0)
 
-	switch (iter->out_next_data)
+	struct proc_dir_entry *entry;
+
+#ifdef IDEBUG
+	printk(KERN_INFO "Creating proc fs entry ...\n");
+#endif
+
+	// consider security risks 0600 - so only root can access the collected information
+	// maybe for testing 0666
+	entry = create_proc_entry(PROC_ENTRY_NAME, 0666, NULL);
+
+	if (entry == NULL)
 	{
-		case OUTPUT_VMR:
-
-			//printk("%d:%d\n", iter->out_next_vm_index, snapshot->vm_region_count);
-			if (iter->out_next_vm_index < snapshot->vm_region_count)
-			{
-				vmi = &snapshot->vms[iter->out_next_vm_index];
-				//V;StartAddr;EndAddr;flags;pg_proto_flags;page_count;present_page_count;filename;
-				ret = scnprintf(result, size, " V%d;0x%lx;0x%lx;%lx;%lx;%u;%u;%u;%s;\n", iter->out_next_vm_index, vmi->start_address, vmi->end_address, vmi->flags, vmi->pf_access, vmi->page_count, vmi->present_page_count, vmi->swapped_page_count, vmi->file_name);
-		
-				//iter->out_next_vm_index++;
-				//enum pages associated with Virtual Memory Region
-				if (ret+1 < size)
-				{
-
-						iter->out_next_data = OUTPUT_PAGE;
-				}
-				else
-				{
-					ret = BUFFER_TOO_SMALL;
-				}
-					
-			}
-			else
-			{
-				// end of road
-				iter->out_next_data = OUTPUT_END;
-				printk("%d PAGES processed:\n" ,pc);
-				goto end_of_road;
-		
-			}
-			break;
-		case OUTPUT_PAGE:
-			//P;PFN;PTE_FLAGS;PAGE_FLAGS;REF_COUNT;MAP_COUNT;HASH;
-			pos = iter->out_next_page_index;
-
-			// this skips not present ptes
-			if (snapshot->flags & VMS_ONLY_PRESENT_PAGES && snapshot->pages[pos].present <= 0)
-				goto try_next;
-			pc++;
-			ret = scnprintf(result, size, "  P%04d(%04d);%06lx;%lx;%lx;%d;%d;%s;\n", iter->out_local_page_index,iter->out_next_page_index, snapshot->pages[pos].pfn, snapshot->pages[pos].pte_flags, snapshot->pages[pos].page_flags, snapshot->pages[pos].reference_count, snapshot->pages[pos].mapping_count, print_page_hash(&snapshot->pages[pos],tmp_hash));
-			if (ret+1 < size)
-			{
-try_next:
-					
-				iter->out_next_page_index++;
-				iter->out_local_page_index++;
-				if (iter->out_local_page_index >= snapshot->vms[iter->out_next_vm_index].page_count)
-				{
-					// we reached the end of a Virtual Memory Region
-					iter->out_local_page_index = 0;
-					iter->out_next_vm_index++;
-					// continue with the next VMR
-					iter->out_next_data = OUTPUT_VMR;
-				}
-			}
-			else
-			{
-				// BUFFER too small
-				ret = BUFFER_TOO_SMALL;
-				pc--;
-			}
-			break;
-		case OUTPUT_END:
-			//E;
-end_of_road:
-				
-				ret = scnprintf(result, size, "E;\n");
-
-					#ifdef IDEBUG
-						printk("END OF ROAD VMI:%d PI:%d\n", iter->out_next_vm_index, iter->out_next_page_index);
-					#endif
-
-					return -1;
-			break;
-		case OUTPUT_START:
-		default:
-			// S;PID;FLAGS;total;shared;vm_region_count;physical_total;physical_shared;timestamp"
-			ret = scnprintf(result, size, "S;%d;%d;%lu;%lu;%u;%lu;%lu;%u;\n", snapshot->pid, snapshot->flags, snapshot->total_pages, snapshot->shared_pages, snapshot->vm_region_count, snapshot->physical_pages, snapshot->available_pages, snapshot->timestamp_end - snapshot->timestamp_begin);
-	
-			// continue with VMR
-			iter->out_next_data = OUTPUT_VMR;
-			break;
+		printk(KERN_ALERT "Cannot create procfs entry %s\n", PROC_ENTRY_NAME);
+		return -1;
 	}
 
-	return ret;
-}
+#ifdef IDEBUG
+	printk(KERN_INFO "Proc fs entry created.\n");
+#endif
 
-static int get_next_snapshot_info(struct SnapshotInfo *snapshot, struct SnapshotIterator *iter,char *result, int size)
-{
-	int ret=0;
-	int pos = 0;
-	struct VirtualMemoryInfo *vmi;
-	char tmp_hash[MAX_HASH_SIZE*2+1];
+	entry->read_proc = read_proc_vm_snapshot;
+	entry->write_proc = write_proc_vm_snapshot;
 
-	switch (iter->out_next_data)
-	{
-		case OUTPUT_VMR:
-			if (iter->out_next_vm_index < snapshot->vm_region_count)
-			{
-				vmi = &snapshot->vms[iter->out_next_vm_index];
-				//V;StartAddr;EndAddr;flags;pg_proto_flags;page_count;present_page_count;filename;
-				ret = scnprintf(result, size, " V%d;0x%lx;0x%lx;%lx;%lx;%u;%u;%u;%s;\n", iter->out_next_vm_index, vmi->start_address, vmi->end_address, vmi->flags, vmi->pf_access, vmi->page_count, vmi->present_page_count, vmi->swapped_page_count, vmi->file_name);
-		
-				//enum pages associated with Virtual Memory Region
-				if (ret+1 < size)
-				{
-					iter->out_next_data = OUTPUT_PAGE;
-				}
-				else
-				{
-					ret = BUFFER_TOO_SMALL;
-				}
-					
-			}
-			else
-			{
-				// end of road
-				iter->out_next_data = OUTPUT_END;
-				goto end_of_road;
-		
-			}
-			break;
-		case OUTPUT_PAGE:
-			//P;PFN;PTE_FLAGS;PAGE_FLAGS;REF_COUNT;MAP_COUNT;HASH;
-			pos = iter->out_next_page_index;
-			if (snapshot->vms[iter->out_next_vm_index].present_page_count == 0)
-				goto next;
+#else
 
-			ret = scnprintf(result, size, "  P%04d(%04d);%06lx;%lx;%lx;%d;%d;%s;\n", iter->out_local_page_index,iter->out_next_page_index, snapshot->pages[pos].pfn, snapshot->pages[pos].pte_flags, snapshot->pages[pos].page_flags, snapshot->pages[pos].reference_count, snapshot->pages[pos].mapping_count, print_page_hash(&snapshot->pages[pos],tmp_hash));
-			if (ret+1 < size)
-			{
-
-				iter->out_next_page_index++;
-				iter->out_local_page_index++;
-				if (iter->out_local_page_index >= snapshot->vms[iter->out_next_vm_index].present_page_count)
-				{
-					// we reached the end of a Virtual Memory Region
-next:
-					iter->out_local_page_index = 0;
-					iter->out_next_vm_index++;
-					// continue with the next VMR
-					iter->out_next_data = OUTPUT_VMR;
-				}
-			}
-			else
-			{
-				// BUFFER too small
-				ret = BUFFER_TOO_SMALL;
-			}
-			break;
-		case OUTPUT_END:
-			//E;
-end_of_road:
-			ret = scnprintf(result, size, "E;\n");
-
-			#ifdef IDEBUG
-				printk("END OF ROAD VMI:%d PI:%d\n", iter->out_next_vm_index, iter->out_next_page_index);
-			#endif
-
-			return -1;
-			break;
-		case OUTPUT_START:
-		default:
-			// S;PID;FLAGS;total;shared;vm_region_count;physical_total;physical_shared;timestamp"
-			ret = scnprintf(result, size, "S;%d;%d;%lu;%lu;%u;%lu;%lu;%u;\n", snapshot->pid, snapshot->flags, snapshot->total_pages, snapshot->shared_pages, snapshot->vm_region_count, snapshot->physical_pages, snapshot->available_pages, snapshot->timestamp_end - snapshot->timestamp_begin);
-	
-			// continue with VMR
-			iter->out_next_data = OUTPUT_VMR;
-			break;
+	//if (register_chrdev(0, PROC_ENTRY_NAME, &device_fops) != 0) {
+	if (proc_create(PROC_ENTRY_NAME, 0666, NULL, &device_fops) != NULL) {
+		return -1;
 	}
+	
+	printk(KERN_INFO "Device entry created.\n");
 
-	return ret;
+#endif
+
+	return 0;
 }
 
+/// Releases the proc entry
+static int release_procfs_entry()
+{
+
+	remove_proc_entry(PROC_ENTRY_NAME, NULL);
+
+#ifdef IDEBUG
+	printk(KERN_INFO "Proc fs entry %s removed.\n", PROC_ENTRY_NAME);
+#endif
+
+	return 0;
+}
+
+static DEFINE_RWLOCK(resource_lock);
+
+static struct resource *r_next(struct resource *p, loff_t *pos)
+{
+	(*pos)++;
+	if (p->child)
+		return p->child;
+	while (!p->sibling && p->parent)
+		p = p->parent;
+	return p->sibling;
+}
+
+static void *r_start(struct resource *p, loff_t *pos)
+__acquires(resource_lock)
+{
+
+	loff_t l = 0;
+	read_lock(&resource_lock);
+	for (p = p->child; p && l < *pos; p = r_next(p, &l))
+		;
+	return p;
+}
+
+static void r_stop(void *v)
+__releases(resource_lock)
+{
+	read_unlock(&resource_lock);
+}
 
 /// This functions helps to get the raw information through the proc fs
 /// assumes all structures exist and pointers are initialized
@@ -693,52 +555,10 @@ static int get_next_raw_info(struct SnapshotInfo *snapshot, struct SnapshotItera
 	}
 	else
 	{
-		printk("We have been called again.\n");
+		//printk("We have been called again.\n");
 		return 0;
 	}
 	return ret;
-}
-
-/// Creates the proc fs entry and sets up the userrights and stuff
-static int create_procfs_entry()
-{
-	struct proc_dir_entry *entry;
-#ifdef IDEBUG
-	printk(KERN_INFO "Creating proc fs entry ...\n");
-#endif
-
-	// consider security risks 0600 - so only root can access the collected information
-	// maybe for testing 0666
-	entry = create_proc_entry(PROC_ENTRY_NAME, 0600, NULL);
-
-	if (entry==NULL)
-	{
-		printk(KERN_ALERT "Cannot create procfs entry %s\n", PROC_ENTRY_NAME);
-		return -1;
-	}
-
-#ifdef IDEBUG
-	printk(KERN_INFO "Proc fs entry created.\n");
-#endif
-
-	entry->read_proc	= read_proc_vm_snapshot;
-	entry->write_proc	= write_proc_vm_snapshot;
-
-
-	return 0;
-}
-
-/// Releases the proc entry
-static int release_procfs_entry()
-{
-
-	remove_proc_entry(PROC_ENTRY_NAME, NULL);
-
-#ifdef IDEBUG
-	printk(KERN_INFO "Proc fs entry %s removed.\n", PROC_ENTRY_NAME);
-#endif
-
-	return 0;
 }
 
 /// checks is a snapshot is ready and can be used
@@ -904,7 +724,6 @@ static int take_snapshot(struct input_buffer *input, struct SnapshotInfo **ptr)
 	snapshot->heap_start	= meminfo->start_brk;
 	snapshot->heap_end		= meminfo->brk;
 
-
 	// timestamp for measurements
 	snapshot->timestamp_begin = jiffies_to_msecs(jiffies);
 
@@ -1032,7 +851,7 @@ static int process_input(const char *buffer, struct input_buffer *result)
 
 			// process flags
 			res = simple_strtoul(++eofstr, &eofstr, 16);
-			result->flags = res;
+			result->flags = res | VMS_ALLOW_RAW_OUTPUT;
 		}
 		else 
 		{
@@ -1050,7 +869,7 @@ static int process_input(const char *buffer, struct input_buffer *result)
 	else
 	{
 		//TODO remove this:  just for testing
-		result->pid = 1567;
+		result->pid   = 1;
 		result->flags = 0;
 		return -1;
 	}
@@ -1059,7 +878,6 @@ static int process_input(const char *buffer, struct input_buffer *result)
 /// localize the mm_struct, which describes the virtual memory of a process
 static int acquire_mm_struct( int pid, struct mm_struct **result)
 {
-
 	struct task_struct *task;
 
 	// Localize the task_struct, function documented in UTLK is deprecated and symbole could not be found during module load
@@ -1184,7 +1002,6 @@ static int put_fileinfo(struct file* fs, struct VirtualMemoryInfo* vminfo)
 /// assumes all structures exist
 /// @pages - it assumed that enough memory is available
 /// return: count of pages 
-
 static unsigned long collect_complete_page_data(int index, struct mm_struct* meminfo, struct vm_area_struct* vma, struct VirtualMemoryInfo* vminfo, struct PageTableEntryInfo* pages, int (*hash_page)(struct page *pg, char *result))
 {
 	int page_count = 0;
@@ -1595,9 +1412,9 @@ static int hash_page_md5(struct page *pg, char *result)
 	printk(KERN_INFO "Hashing: digest cycles: %llu\n", (unsigned long long)end-start);
 // not my code
 	for (i=0; i <crypto_hash_digestsize(tfm); i++ ) {
-                         printk("%02x", (unsigned char) result[i]);
-                 }
-                 printk("\n");
+		printk("%02x", (unsigned char) result[i]);
+	}
+	printk("\n");
 // end not my code
 #endif
 	crypto_free_hash(tfm);
@@ -1637,9 +1454,9 @@ static int hash_page_sha1(struct page *pg, char *result)
 	printk(KERN_INFO "Hashing: digest cycles: %llu\n", (unsigned long long)end-start);
 // not my code
 	for (i=0; i <crypto_hash_digestsize(tfm); i++ ) {
-                         printk("%02x", (unsigned char) result[i]);
-                 }
-                 printk("\n");
+		printk("%02x", (unsigned char) result[i]);
+	}
+	printk("\n");
 // end not my code
 #endif
 	crypto_free_hash(tfm);
@@ -1647,6 +1464,7 @@ static int hash_page_sha1(struct page *pg, char *result)
 	return 0;
 }
 
+#ifdef DODEBUG
 /// transfers the hash into a string - 
 /// assumes all parameters are initialized
 /// @result has enough space to contain MAX_HASH_SIZE*2 +1 chars
@@ -1668,6 +1486,7 @@ static char* print_page_hash(struct PageTableEntryInfo *ptei, char *result)
 	*result='\0';
 	return start;
 }
+#endif
 
 /// creates a crc32 checksum 
 /// pg: is a pointer to a page (PAGE_SIZE)
